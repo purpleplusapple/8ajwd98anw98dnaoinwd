@@ -13,14 +13,11 @@
         }
     });
 
-    // Override fetch
-    window.fetch = async function(...args) {
+    // Proxy function
+    const proxyFetch = async function(...args) {
         if (isRecording) {
             try {
                 const [resource, config] = args;
-                // Clone headers and body if possible to avoid consuming streams
-                // This is tricky for bodies (ReadableStream).
-                // We'll try to clone the request if it is a Request object.
 
                 let url = resource;
                 let method = 'GET';
@@ -31,7 +28,6 @@
                     url = resource.url;
                     method = resource.method;
                     headers = Object.fromEntries(resource.headers.entries());
-                    // Body cloning is complex, skipping for brevity in this first pass or assuming simple config object usage
                 } else {
                     url = resource.toString();
                     if (config) {
@@ -45,9 +41,6 @@
                     }
                 }
 
-                // If body is a string, we can capture it. If it's FormData, we might need to parse it.
-                // For Veo, it likely sends JSON or FormData.
-
                 // Notify content script
                 window.postMessage({
                     source: 'VEO_EXTENSION_INJECTED',
@@ -56,7 +49,7 @@
                         url,
                         method,
                         headers,
-                        body: body // This might be a string, or object.
+                        body: body
                     }
                 }, '*');
 
@@ -68,13 +61,14 @@
         return originalFetch.apply(this, args);
     };
 
+    // Anti-Detection: Override toString to return native code string
+    proxyFetch.toString = function() {
+        return "function fetch() { [native code] }";
+    };
+
     // Maintain prototype chain and enumerability to avoid detection
-    // fetch is usually enumerable: true, configurable: true, writable: true on window
-    // But let's check exact descriptors if we want to be super stealthy.
-    // For now, simple assignment is usually enough for functional extensions unless heavy anti-bot.
-    // To be safer:
     Object.defineProperty(window, 'fetch', {
-        value: window.fetch,
+        value: proxyFetch,
         writable: true,
         enumerable: true,
         configurable: true

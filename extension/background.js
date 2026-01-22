@@ -11,7 +11,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     }
 });
 
-// Context Menus for controlling recording and actions
+// Context Menus
 chrome.runtime.onInstalled.addListener(() => {
     chrome.contextMenus.create({
         id: "veo_toggle_record",
@@ -40,7 +40,6 @@ let lastCapturedRequest = null;
 chrome.contextMenus.onClicked.addListener((info, tab) => {
     if (info.menuItemId === "veo_toggle_record") {
         isRecording = !isRecording;
-        // Notify content script in the active tab
         chrome.tabs.sendMessage(tab.id, { type: 'SET_RECORDING', value: isRecording });
         console.log('Recording:', isRecording);
     } else if (info.menuItemId === "veo_save_upload_template") {
@@ -59,14 +58,8 @@ function handleCapturedRequest(requestPayload) {
 }
 
 async function saveTemplate(type, request) {
-    // Sanitize and parameterize
-    // We assume the user just did the action.
-    // For GENERATE_VIDEO, we look for the prompt in the body and replace it.
-
     let bodyStructure = request.body;
 
-    // Naive replacement logic for demonstration
-    // If body is JSON string, parse it
     if (typeof bodyStructure === 'string') {
         try {
             bodyStructure = JSON.parse(bodyStructure);
@@ -75,24 +68,12 @@ async function saveTemplate(type, request) {
         }
     }
 
-    // Identify and replace values with placeholders
-    // This part is highly dependent on Veo's actual API structure.
-    // We'll traverse the object and replace strings that look like user inputs if we could identify them.
-    // For now, we will assume the user manually edits or we replace known keys.
-    // BUT the requirement says: "replace specific prompt text with a placeholder {{PROMPT}}"
-    // We'll search recursively for a long string? Or just assume a key named 'prompt' or 'text'.
-
     function recursiveReplace(obj) {
         for (let key in obj) {
             if (typeof obj[key] === 'string') {
-                // If we knew the prompt used, we could replace it.
-                // Since we don't know the exact prompt user typed, we might need the user to tell us,
-                // or we just save it as is and the backend/UI allows editing,
-                // OR we blindly replace common keys like 'prompt', 'input_text'.
                 if (key === 'prompt' || key === 'text') {
                     obj[key] = '{{PROMPT}}';
                 }
-                // Check for Aspect Ratio (e.g. "16:9")
                 if (obj[key] === '16:9' || obj[key] === '9:16') {
                     obj[key] = '{{ASPECT_RATIO}}';
                 }
@@ -102,7 +83,6 @@ async function saveTemplate(type, request) {
         }
     }
 
-    // Clone to avoid mutating original if needed
     let sanitizedBody = JSON.parse(JSON.stringify(bodyStructure));
     recursiveReplace(sanitizedBody);
 
@@ -130,7 +110,7 @@ async function saveTemplate(type, request) {
 
 function startPolling() {
     if (pollingInterval) clearInterval(pollingInterval);
-    pollingInterval = setInterval(pollForJobs, 5000); // 5 seconds
+    pollingInterval = setInterval(pollForJobs, 5000);
     console.log('Polling started...');
 }
 
@@ -151,36 +131,27 @@ async function processJob(job, templates) {
     console.log('Processing Job:', job.id);
 
     try {
-        let result = null;
+        let resultUrl = null;
 
-        // Determine Templates
         const uploadTemplate = templates.find(t => t.type === 'UPLOAD_IMAGE');
         const generateTemplate = templates.find(t => t.type === 'GENERATE_VIDEO');
 
-        // Logic:
-        // If Job has Image -> Execute Upload -> Get ID -> Execute Generate
-        // Else -> Execute Generate
-
         let imageId = null;
 
+        // 1. Upload Phase
         if (job.reference_image_path && uploadTemplate) {
-            // Random delay
             await delay(Math.random() * 2000 + 1000);
 
-            // Execute Upload
-            // We need to pass the image data.
-            // job.imageBase64 contains the data.
             const uploadRes = await executeTemplate(uploadTemplate, {
                 imageBase64: job.imageBase64
             });
 
-            // Extract Image ID from response.
-            // This is specific to Veo's API. We'll assume it returns JSON with an ID.
-            // Adjust path as necessary.
+            // Assume the response contains an ID field
             imageId = uploadRes.id || uploadRes.file_id;
             console.log('Image uploaded, ID:', imageId);
         }
 
+        // 2. Generate Phase
         if (generateTemplate) {
             await delay(Math.random() * 2000 + 1000);
 
@@ -190,23 +161,35 @@ async function processJob(job, templates) {
                 imageId: imageId
             });
 
-            // Result URL
-            // Assume generateRes contains the video URL or ID.
-            result = generateRes.url || generateRes.video_url || "https://placeholder.com/video.mp4";
+            // Assume the response contains the video URL
+            resultUrl = generateRes.url || generateRes.video_url;
+            if (!resultUrl) throw new Error("No video URL found in response");
+        } else {
+             throw new Error("No generation template found");
         }
 
-        // Save result
+        // 3. Download & Save Phase
+        console.log('Downloading result from:', resultUrl);
+        const videoBlob = await fetch(resultUrl).then(r => {
+            if (!r.ok) throw new Error(`Failed to download video: ${r.status}`);
+            return r.blob();
+        });
+
+        const formData = new FormData();
+        formData.append('jobId', job.id);
+        formData.append('videoFile', videoBlob, `job-${job.id}.mp4`);
+
         await fetch(`${BACKEND_URL}/save`, {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                jobId: job.id,
-                resultUrl: result
-            })
+            body: formData
         });
+
+        console.log('Job completed and saved.');
 
     } catch (err) {
         console.error('Job failed:', err);
+        // Error reporting needs to match what backend expects for error
+        // Backend expects JSON body with jobId and error
         await fetch(`${BACKEND_URL}/save`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -219,14 +202,9 @@ async function processJob(job, templates) {
 }
 
 async function executeTemplate(template, data) {
-    // 1. Prepare URL
     let url = template.url;
-
-    // 2. Prepare Body
     let body = template.body_structure;
 
-    // Replace placeholders
-    // Helper to traverse and replace
     function replaceValues(obj) {
         if (typeof obj === 'string') {
             let val = obj;
@@ -243,22 +221,14 @@ async function executeTemplate(template, data) {
         return obj;
     }
 
-    // Clone body
     let requestBody = JSON.parse(JSON.stringify(body));
     replaceValues(requestBody);
 
-    // 3. Execute in the context of a tab?
-    // "Execute the fetch request within the target tab context to bypass CORS/Auth issues."
-    // `fetch` in background script might fail if cookies are HttpOnly or strict CORS.
-    // We should use `scripting.executeScript` to run fetch in the active tab.
-
-    // We need a target tab.
     // Parse origin from template.url
     let origin;
     try {
         origin = new URL(url).origin;
     } catch (e) {
-        // Fallback if url is relative (unlikely for captured requests)
         throw new Error("Invalid template URL");
     }
 
@@ -268,36 +238,27 @@ async function executeTemplate(template, data) {
 
     if (!targetTabId) throw new Error(`No open tab found for ${origin}. Please open the Veo site.`);
 
-    // We pass the parameters to the injected function
     const result = await chrome.scripting.executeScript({
         target: { tabId: targetTabId },
         func: injectedFetch,
         args: [url, template.method, template.headers, requestBody]
     });
 
-    // executeScript returns array of results.
     return result[0].result;
 }
 
-// This function runs INSIDE the page
 async function injectedFetch(url, method, headers, body) {
     try {
-        // Prepare options
         const options = {
             method: method,
             headers: headers,
         };
 
-        // If body is object, stringify it
         if (body && typeof body === 'object') {
-            // Check if headers say json
-            // headers might be object
             const isJson = Object.keys(headers).some(k => k.toLowerCase() === 'content-type' && headers[k].includes('json'));
             if (isJson) {
                 options.body = JSON.stringify(body);
             } else {
-                // If not JSON, maybe it's formData? or urlencoded?
-                // For now assuming JSON as standard for these APIs
                  options.body = JSON.stringify(body);
             }
         } else {

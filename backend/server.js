@@ -11,7 +11,7 @@ const PORT = 3001;
 
 // Middleware
 app.use(cors());
-app.use(bodyParser.json({ limit: '50mb' })); // Increased limit for base64 images/videos
+app.use(bodyParser.json({ limit: '50mb' }));
 app.use(bodyParser.urlencoded({ extended: true, limit: '50mb' }));
 
 // Ensure uploads directory exists
@@ -20,7 +20,7 @@ if (!fs.existsSync(uploadsDir)) {
     fs.mkdirSync(uploadsDir);
 }
 
-// Storage for uploaded files (referenced in jobs)
+// Storage for uploaded files
 const storage = multer.diskStorage({
     destination: function (req, file, cb) {
         cb(null, 'uploads/')
@@ -44,19 +44,19 @@ const db = new sqlite3.Database('./jobs.db', (err) => {
 function initializeDatabase() {
     db.run(`CREATE TABLE IF NOT EXISTS templates (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        type TEXT NOT NULL, -- 'UPLOAD_IMAGE' or 'GENERATE_VIDEO'
+        type TEXT NOT NULL,
         url TEXT NOT NULL,
         method TEXT NOT NULL,
-        headers TEXT, -- JSON string
-        body_structure TEXT -- JSON string with placeholders
+        headers TEXT,
+        body_structure TEXT
     )`);
 
     db.run(`CREATE TABLE IF NOT EXISTS jobs (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         prompt TEXT,
         reference_image_path TEXT,
-        status TEXT DEFAULT 'PENDING', -- 'PENDING', 'PROCESSING', 'COMPLETED', 'FAILED'
-        settings TEXT, -- JSON string (ratio, duration, etc.)
+        status TEXT DEFAULT 'PENDING',
+        settings TEXT,
         result_path TEXT,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     )`);
@@ -68,9 +68,6 @@ function initializeDatabase() {
 app.post('/api/templates', (req, res) => {
     const { type, url, method, headers, body_structure } = req.body;
 
-    // Upsert or simple insert. For simplicity, we just insert.
-    // In a real app, might want to replace existing template of same type.
-    // Let's delete existing template of same type first to keep it simple (latest wins).
     db.run(`DELETE FROM templates WHERE type = ?`, [type], (err) => {
         if (err) {
             return res.status(500).json({ error: err.message });
@@ -135,7 +132,6 @@ app.get('/api/jobs', (req, res) => {
 
 // 3. Poll for pending jobs (called by Extension)
 app.get('/api/poll', (req, res) => {
-    // Find the oldest PENDING job
     db.get("SELECT * FROM jobs WHERE status = 'PENDING' ORDER BY created_at ASC LIMIT 1", [], (err, job) => {
         if (err) {
             return res.status(500).json({ error: err.message });
@@ -145,20 +141,15 @@ app.get('/api/poll', (req, res) => {
             return res.json({ job: null });
         }
 
-        // Also fetch templates needed
         db.all("SELECT * FROM templates", [], (err, templates) => {
             if (err) {
                 return res.status(500).json({ error: err.message });
             }
 
-            // Mark job as PROCESSING
             db.run("UPDATE jobs SET status = 'PROCESSING' WHERE id = ?", [job.id], (err) => {
                 if (err) console.error("Error updating job status", err);
             });
 
-            // If job has reference image, read it and convert to base64 if needed
-            // Ideally we pass the path or serving URL, but extension context might need base64.
-            // Let's provide base64 for the extension.
             let imageBase64 = null;
             if (job.reference_image_path) {
                 try {
@@ -185,9 +176,9 @@ app.get('/api/poll', (req, res) => {
     });
 });
 
-// 4. Save final result (called by Extension)
-app.post('/api/save', (req, res) => {
-    const { jobId, resultUrl, error } = req.body;
+// 4. Save final result (Updated)
+app.post('/api/save', upload.single('videoFile'), (req, res) => {
+    const { jobId, error } = req.body;
 
     if (error) {
         db.run("UPDATE jobs SET status = 'FAILED' WHERE id = ?", [jobId], (err) => {
@@ -195,17 +186,28 @@ app.post('/api/save', (req, res) => {
             return res.json({ message: 'Job marked as failed' });
         });
     } else {
-        // In a real scenario, the extension might upload the video file here.
-        // For now, we assume it sends a URL or we just store the text URL if hosted elsewhere,
-        // OR the extension could send the blob as base64 and we save it.
-        // Let's assume the extension might send a resultPath or we just store the URL.
+        // The file is saved by multer in 'uploads/'
+        // We need to store the path or a URL to it.
+        // Assuming we serve uploads statically or just reference the path.
+        const file = req.file;
+        if (!file) {
+             return res.status(400).json({ error: "No file uploaded and no error reported" });
+        }
 
-        db.run("UPDATE jobs SET status = 'COMPLETED', result_path = ? WHERE id = ?", [resultUrl, jobId], (err) => {
+        // For local use, we can store absolute path or relative.
+        // Let's store the relative path 'uploads/filename' or absolute if preferred.
+        // Requirement says: "Update the SQLite database result_path with the absolute local path"
+        const absolutePath = path.resolve(file.path);
+
+        db.run("UPDATE jobs SET status = 'COMPLETED', result_path = ? WHERE id = ?", [absolutePath, jobId], (err) => {
             if (err) return res.status(500).json({ error: err.message });
-            return res.json({ message: 'Job completed' });
+            return res.json({ message: 'Job completed', path: absolutePath });
         });
     }
 });
+
+// Serve uploads so frontend can view them (optional but good practice)
+app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
 app.listen(PORT, () => {
     console.log(`Server running on http://localhost:${PORT}`);
